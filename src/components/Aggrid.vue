@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, shallowRef, defineProps, watch } from 'vue';
+import { ref, shallowRef, defineProps, defineEmits, withDefaults, watch } from 'vue';
 import { AgGridVue } from 'ag-grid-vue3';
 import {
   themeQuartz,
@@ -11,35 +11,44 @@ import {
   type ColDef
 } from 'ag-grid-community';
 
-// Extend the props interface to include isLoading
+// Extend the props interface
 interface AgGridProps<T> {
-  // Columns are required and describe the data shape.
   columns: ColDef<T>[];
-  // Row data is required and must be compatible with the columns.
   rowData: T[] | null;
-  verticalAutoFit?: boolean;
-  horizontalAutoFit?: boolean;
   isLoading: boolean;
+  horizontalAutoFit?: boolean;
+  verticalAutoFit?: boolean;
+  rowCount?: number;         // default rows per page
+  isServerSide?: boolean;    // default false
 }
 
-// Define props; now isLoading is required.
-const props = defineProps<AgGridProps<any>>();
+// Use withDefaults to provide default values for isServerSide and rowCount
+const props = withDefaults(defineProps<AgGridProps<any>>(), {
+  isServerSide: false,
+  rowCount: 10
+});
+
+// Define our custom event. We emit a 'pageChange' event with page number and rowCount.
+const emit = defineEmits<{
+  (event: 'pageChange', payload: { page: number, rowCount: number }): void;
+}>();
 
 // --- Dynamic Row Height Logic ---
 let minRowHeight = 25;
 let currentRowHeight: number;
 
-// Use a shallow ref for the grid API.
+// Shallow ref to hold the grid API.
 const gridApi = shallowRef<GridApi | null>(null);
 
-// Function to update row heights based on available vertical space.
+// We'll also store a computed row count for pagination when verticalAutoFit is true.
+const computedRowCount = ref(props.rowCount);
+
+// Function to update row heights.
 const updateRowHeight = (params: { api: GridApi }) => {
   const bodyViewport = document.querySelector(".ag-body-viewport");
   if (!bodyViewport) return;
-
   const gridHeight = bodyViewport.clientHeight;
   const renderedRowCount = params.api.getDisplayedRowCount();
-
   if (renderedRowCount * minRowHeight >= gridHeight) {
     if (currentRowHeight !== minRowHeight) {
       currentRowHeight = minRowHeight;
@@ -51,23 +60,19 @@ const updateRowHeight = (params: { api: GridApi }) => {
   }
 };
 
-// Provide row height via a callback.
-const getRowHeight = ref((params: RowHeightParams) => {
-  return currentRowHeight;
-});
+// Provide row height via callback.
+const getRowHeight = ref((params: RowHeightParams) => currentRowHeight);
 
 // --- Grid Events ---
 function onFirstDataRendered(params: FirstDataRenderedEvent) {
-  if (props.horizontalAutoFit) {
-    updateRowHeight(params);
-  }
-  if (props.verticalAutoFit) {
-    params.api.sizeColumnsToFit();
-  }
+  if (props.verticalAutoFit) updateRowHeight(params);
+  if (props.horizontalAutoFit) params.api.sizeColumnsToFit();
 }
 
 function onGridSizeChanged(params: GridSizeChangedEvent) {
-  const gridWidth = document.querySelector(".ag-body-viewport")!.clientWidth;
+  const bodyViewport = document.querySelector(".ag-body-viewport");
+  if (!bodyViewport) return;
+  const gridWidth = bodyViewport.clientWidth;
   const columnsToShow: string[] = [];
   const columnsToHide: string[] = [];
   let totalColsWidth = 0;
@@ -85,23 +90,103 @@ function onGridSizeChanged(params: GridSizeChangedEvent) {
   }
   params.api.setColumnsVisible(columnsToShow, true);
   params.api.setColumnsVisible(columnsToHide, false);
-  
-  if (props.verticalAutoFit) {
-    window.setTimeout(() => {
-      params.api.sizeColumnsToFit();
-    }, 10);
-  }
   if (props.horizontalAutoFit) {
-    updateRowHeight(params);
+    window.setTimeout(() => params.api.sizeColumnsToFit(), 10);
   }
-}
+  if (props.verticalAutoFit) {
+    // Use the grid viewport height divided by the minimum row height
+    const gridHeight = bodyViewport.clientHeight;
+    let newRowCount = Math.floor(gridHeight / minRowHeight);
+    if (newRowCount < 1) newRowCount = 1;
+    computedRowCount.value = newRowCount;
+    if (gridApi.value && !props.isServerSide) {
+      gridApi.value.setGridOption('paginationPageSize', newRowCount);
+    }
+  }
+};
+
+const updatePaginationState = () => {
+  if (gridApi.value && !props.isServerSide) {
+    currentPage.value = gridApi.value.paginationGetCurrentPage();
+    totalPages.value = gridApi.value.paginationGetTotalPages();
+  }
+};
 
 const onGridReady = (params: GridReadyEvent) => {
   gridApi.value = params.api;
   minRowHeight = params.api.getSizesForCurrentTheme().rowHeight;
   currentRowHeight = minRowHeight;
 
+  // For client-side pagination, enable pagination and set page size.
+  if (!props.isServerSide) {
+    gridApi.value.setGridOption('pagination', true);
+    gridApi.value.setGridOption('paginationPageSize', props.rowCount);
+    gridApi.value.setGridOption('suppressPaginationPanel', true);
+    gridApi.value.addEventListener('paginationChanged', updatePaginationState);
+    updatePaginationState();
+  }
+
+  // Set loading state.
   gridApi.value.setGridOption('loading', props.isLoading);
+};
+
+// --- Reactive Pagination State (for client-side only) ---
+const currentPage = ref(0);
+const totalPages = ref(0);
+
+// --- Custom Pagination Handlers ---
+const firstPage = () => {
+  if (props.isServerSide) {
+    currentPage.value = 0;
+    emit('pageChange', { page: 0, rowCount: computedRowCount.value });
+  } else if (gridApi.value) {
+    gridApi.value.paginationGoToPage(0);
+    updatePaginationState();
+    emit('pageChange', { page: 0, rowCount: computedRowCount.value });
+  }
+};
+
+const previousPage = () => {
+  if (currentPage.value > 0) {
+    const newPage = currentPage.value - 1;
+    if (props.isServerSide) {
+      currentPage.value = newPage;
+      emit('pageChange', { page: newPage, rowCount: computedRowCount.value });
+    } else if (gridApi.value) {
+      gridApi.value.paginationGoToPage(newPage);
+      updatePaginationState();
+      emit('pageChange', { page: newPage, rowCount: computedRowCount.value });
+    }
+  }
+};
+
+const nextPage = () => {
+  if (props.isServerSide) {
+    const newPage = currentPage.value + 1;
+    currentPage.value = newPage;
+    emit('pageChange', { page: newPage, rowCount: computedRowCount.value });
+  } else if (gridApi.value) {
+    const curr = gridApi.value.paginationGetCurrentPage();
+    const total = gridApi.value.paginationGetTotalPages();
+    if (curr < total - 1) {
+      const newPage = curr + 1;
+      gridApi.value.paginationGoToPage(newPage);
+      updatePaginationState();
+      emit('pageChange', { page: newPage, rowCount: computedRowCount.value });
+    }
+  }
+};
+
+const lastPage = () => {
+  if (props.isServerSide) {
+    emit('pageChange', { page: -1, rowCount: computedRowCount.value });
+  } else if (gridApi.value) {
+    const total = gridApi.value.paginationGetTotalPages();
+    const last = total - 1;
+    gridApi.value.paginationGoToPage(last);
+    updatePaginationState();
+    emit('pageChange', { page: last, rowCount: computedRowCount.value });
+  }
 };
 
 // --- Custom Templates for Overlays ---
@@ -129,29 +214,55 @@ const gridOptions = {
     filter: true,
   },
   overlayNoRowsTemplate: emptyStateTemplate,
-  overlayLoadingTemplate: loadingTemplate
+  overlayLoadingTemplate: loadingTemplate,
+  pagination: true,
+  paginationPageSize: props.rowCount, // initial value; will be updated if verticalAutoFit is true
+  paginationPageSizeSelector: false, // disable built-in page size selector
+  suppressPaginationPanel: true,
 };
 
-// --- Watch for Changes to isLoading ---
 watch(
   () => props.isLoading,
   (newVal) => {
     if (!gridApi.value) return;
     gridApi.value.setGridOption('loading', newVal);
+    if (!newVal) {
+      // Force hide the overlay if loading is turned off.
+      gridApi.value.hideOverlay();
+    }
   }
 );
 </script>
 
 <template>
-  <ag-grid-vue 
-    style="width: 100%; height: 100%" 
-    :theme="themeQuartz" 
-    :columnDefs="props.columns" 
-    :rowData="props.rowData"
-    :gridOptions="gridOptions" 
-    :getRowHeight="getRowHeight"
-    @grid-ready="onGridReady"
-    @first-data-rendered="onFirstDataRendered"
-    @grid-size-changed="onGridSizeChanged"
-  />
+  <div class="size-full">
+    <ag-grid-vue style="width: 100%; height: 100%;" :theme="themeQuartz" :columnDefs="props.columns"
+      :rowData="props.rowData" :gridOptions="gridOptions" :getRowHeight="getRowHeight" @grid-ready="onGridReady"
+      @first-data-rendered="onFirstDataRendered" @grid-size-changed="onGridSizeChanged" />
+
+    <div class="cursor-pointer mt-4 flex items-center justify-center space-x-4">
+      <button @click="firstPage" :disabled="!props.isServerSide && currentPage === 0"
+        class="px-3 py-1 bg-gray-300 rounded disabled:opacity-50">
+        First
+      </button>
+      <button @click="previousPage" :disabled="!props.isServerSide && currentPage === 0"
+        class="px-3 py-1 bg-gray-300 rounded disabled:opacity-50">
+        Previous
+      </button>
+      <span v-if="!props.isServerSide">
+        Page {{ currentPage + 1 }} of {{ totalPages }}
+      </span>
+      <span v-else>
+        Page {{ currentPage + 1 }}
+      </span>
+      <button @click="nextPage" :disabled="!props.isServerSide && currentPage >= totalPages - 1"
+        class="px-3 py-1 bg-gray-300 rounded disabled:opacity-50">
+        Next
+      </button>
+      <button @click="lastPage" :disabled="!props.isServerSide && currentPage >= totalPages - 1"
+        class="px-3 py-1 bg-gray-300 rounded disabled:opacity-50">
+        Last
+      </button>
+    </div>
+  </div>
 </template>
