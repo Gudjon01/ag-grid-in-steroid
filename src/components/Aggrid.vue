@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, shallowRef, defineProps, defineEmits, withDefaults, watch } from 'vue';
+import { ref, shallowRef, defineProps, defineEmits, withDefaults, watch, computed } from 'vue';
 import { AgGridVue } from 'ag-grid-vue3';
 import {
   themeQuartz,
@@ -11,7 +11,7 @@ import {
   type ColDef
 } from 'ag-grid-community';
 
-// Extend the props interface
+// Extend the props interface to include totalRowCount
 interface AgGridProps<T> {
   columns: ColDef<T>[];
   rowData: T[] | null;
@@ -20,9 +20,10 @@ interface AgGridProps<T> {
   verticalAutoFit?: boolean;
   rowCount?: number;         // default rows per page
   isServerSide?: boolean;    // default false
+  totalRowCount?: number;    // total rows in the dataset (for server-side)
 }
 
-// Use withDefaults to provide default values for isServerSide and rowCount
+// Provide default values for isServerSide and rowCount.
 const props = withDefaults(defineProps<AgGridProps<any>>(), {
   isServerSide: false,
   rowCount: 10
@@ -48,16 +49,10 @@ const updateRowHeight = (params: { api: GridApi }) => {
   const bodyViewport = document.querySelector(".ag-body-viewport");
   if (!bodyViewport) return;
   const gridHeight = bodyViewport.clientHeight;
-  const renderedRowCount = params.api.getDisplayedRowCount();
-  if (renderedRowCount * minRowHeight >= gridHeight) {
-    if (currentRowHeight !== minRowHeight) {
-      currentRowHeight = minRowHeight;
-      params.api.resetRowHeights();
-    }
-  } else {
-    currentRowHeight = Math.floor(gridHeight / renderedRowCount);
-    params.api.resetRowHeights();
-  }
+  // Instead of using rendered row count, we rely on minRowHeight for a consistent value.
+  // (Assuming minRowHeight comes from the theme.)
+  currentRowHeight = minRowHeight;
+  params.api.resetRowHeights();
 };
 
 // Provide row height via callback.
@@ -94,7 +89,7 @@ function onGridSizeChanged(params: GridSizeChangedEvent) {
     window.setTimeout(() => params.api.sizeColumnsToFit(), 10);
   }
   if (props.verticalAutoFit) {
-    // Use the grid viewport height divided by the minimum row height
+    // Calculate new row count using the grid viewport height and minRowHeight.
     const gridHeight = bodyViewport.clientHeight;
     let newRowCount = Math.floor(gridHeight / minRowHeight);
     if (newRowCount < 1) newRowCount = 1;
@@ -114,6 +109,7 @@ const updatePaginationState = () => {
 
 const onGridReady = (params: GridReadyEvent) => {
   gridApi.value = params.api;
+  // Get minRowHeight from the theme.
   minRowHeight = params.api.getSizesForCurrentTheme().rowHeight;
   currentRowHeight = minRowHeight;
 
@@ -133,6 +129,19 @@ const onGridReady = (params: GridReadyEvent) => {
 // --- Reactive Pagination State (for client-side only) ---
 const currentPage = ref(0);
 const totalPages = ref(0);
+
+// --- Computed Total Pages for Server-Side ---
+const serverTotalPages = computed(() => {
+  if (props.isServerSide && props.totalRowCount != null) {
+    return Math.ceil(props.totalRowCount / computedRowCount.value);
+  }
+  return 0;
+});
+
+// A unified computed property for display total pages.
+const displayTotalPages = computed(() => {
+  return props.isServerSide ? serverTotalPages.value : totalPages.value;
+});
 
 // --- Custom Pagination Handlers ---
 const firstPage = () => {
@@ -162,9 +171,12 @@ const previousPage = () => {
 
 const nextPage = () => {
   if (props.isServerSide) {
-    const newPage = currentPage.value + 1;
-    currentPage.value = newPage;
-    emit('pageChange', { page: newPage, rowCount: computedRowCount.value });
+    // Only allow next if current page is less than serverTotalPages - 1.
+    if (currentPage.value < serverTotalPages.value - 1) {
+      const newPage = currentPage.value + 1;
+      currentPage.value = newPage;
+      emit('pageChange', { page: newPage, rowCount: computedRowCount.value });
+    }
   } else if (gridApi.value) {
     const curr = gridApi.value.paginationGetCurrentPage();
     const total = gridApi.value.paginationGetTotalPages();
@@ -179,7 +191,12 @@ const nextPage = () => {
 
 const lastPage = () => {
   if (props.isServerSide) {
-    emit('pageChange', { page: -1, rowCount: computedRowCount.value });
+    // For server-side, jump to the last page (if available).
+    const last = serverTotalPages.value - 1;
+    if (last >= 0) {
+      currentPage.value = last;
+      emit('pageChange', { page: last, rowCount: computedRowCount.value });
+    }
   } else if (gridApi.value) {
     const total = gridApi.value.paginationGetTotalPages();
     const last = total - 1;
@@ -217,7 +234,7 @@ const gridOptions = {
   overlayLoadingTemplate: loadingTemplate,
   pagination: true,
   paginationPageSize: props.rowCount, // initial value; will be updated if verticalAutoFit is true
-  paginationPageSizeSelector: false, // disable built-in page size selector
+  paginationPageSizeSelector: false,    // disable built-in page size selector
   suppressPaginationPanel: true,
 };
 
@@ -240,12 +257,13 @@ watch(
       :rowData="props.rowData" :gridOptions="gridOptions" :getRowHeight="getRowHeight" @grid-ready="onGridReady"
       @first-data-rendered="onFirstDataRendered" @grid-size-changed="onGridSizeChanged" />
 
+    <!-- Custom Pagination Controls -->
     <div class="cursor-pointer mt-4 flex items-center justify-center space-x-4">
-      <button @click="firstPage" :disabled="!props.isServerSide && currentPage === 0"
+      <button @click="firstPage" :disabled="currentPage === 0"
         class="px-3 py-1 bg-gray-300 rounded disabled:opacity-50">
         First
       </button>
-      <button @click="previousPage" :disabled="!props.isServerSide && currentPage === 0"
+      <button @click="previousPage" :disabled="currentPage === 0"
         class="px-3 py-1 bg-gray-300 rounded disabled:opacity-50">
         Previous
       </button>
@@ -253,13 +271,14 @@ watch(
         Page {{ currentPage + 1 }} of {{ totalPages }}
       </span>
       <span v-else>
-        Page {{ currentPage + 1 }}
+        Page {{ currentPage + 1 }} of {{ serverTotalPages }}
       </span>
-      <button @click="nextPage" :disabled="!props.isServerSide && currentPage >= totalPages - 1"
+      <button @click="nextPage"
+        :disabled="props.isServerSide ? currentPage >= serverTotalPages - 1 : currentPage >= totalPages - 1"
         class="px-3 py-1 bg-gray-300 rounded disabled:opacity-50">
         Next
       </button>
-      <button @click="lastPage" :disabled="!props.isServerSide && currentPage >= totalPages - 1"
+      <button @click="lastPage" :disabled="props.isServerSide ? currentPage >= serverTotalPages - 1 : currentPage >= totalPages - 1"
         class="px-3 py-1 bg-gray-300 rounded disabled:opacity-50">
         Last
       </button>
